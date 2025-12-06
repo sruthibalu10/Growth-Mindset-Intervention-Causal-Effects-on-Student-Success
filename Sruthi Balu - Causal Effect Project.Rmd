@@ -1,0 +1,218 @@
+---
+title: "STAT MOD PROJECT"
+author: "Sruthi Balu (sb2538)"
+date: "2025-04-22"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r}
+# Load packages
+library(tidyverse)
+library(MatchIt)
+library(survey)
+library(cobalt)
+library(reshape2)
+library(ggplot2)
+library(viridis)
+
+# Load the data
+data <- read.csv("data.csv")  
+
+summary(data[, c("y", "selfrpt", "mindset", "test", "sch_race", "pov", "size")])
+
+#EDA
+
+# Histogram of achievement scores
+ggplot(data, aes(x = y)) +
+  geom_histogram(fill = "orange", bins = 30, color = "black") +
+  labs(title = "Distribution of Achievement Scores", x = "Achievement (y)", y = "Frequency") +
+  theme_minimal()
+
+# Density plot
+ggplot(data, aes(x = mindset, fill = factor(z))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("magenta", "orange")) +
+  labs(title = "Mindset Score Distribution by Treatment Group",
+       x = "Mindset Score", fill = "Treatment") +
+  theme_minimal()
+
+# Scatter Plot of Mindset vs Achievement
+ggplot(data, aes(x = mindset, y = y, color = factor(z))) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c("magenta", "orange")) +  
+  labs(title = "Mindset vs Achievement by Treatment",
+       x = "Mindset Score", y = "Achievement", color = "Treatment") +
+  theme_minimal()
+
+# Heatmap 
+numeric_data <- data %>% select_if(is.numeric)
+cor_matrix <- cor(numeric_data)
+cor_df <- melt(cor_matrix)
+
+ggplot(cor_df, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "magma", limits = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  labs(title = "Correlation Heatmap ",
+       x = "", y = "") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1,
+                                   size = 10, hjust = 1))
+```
+
+```{r}
+# 1. Linear Regression
+
+# Basic model
+lm_model <- lm(y ~ z + selfrpt + gender + race + fgen + urban + mindset + test + sch_race + pov + size, data = data)
+summary(lm_model)
+
+# ATE and 95% CI
+lm_ate <- coef(lm_model)["z"]
+lm_ci <- confint(lm_model)["z", ]
+cat("Linear Regression ATE:", lm_ate, "CI:", lm_ci, "\n")
+
+ate_df <- data.frame(
+  term = "Treatment (z)",
+  estimate = lm_ate,
+  lower = lm_ci[1],
+  upper = lm_ci[2]
+)
+
+# Plot
+ggplot(ate_df, aes(x = term, y = estimate)) +
+  geom_point(size = 3, color = "purple") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.1, color = "purple") +
+  labs(title = "Estimated ATE from LR",
+       x = "", y = "Effect on Achievement") +
+  theme_minimal()
+```
+
+```{r}
+# For linear regression the estimated ATE is 0.4126, meaning that on average students who received the treatment scored 0.41 points more than those who did not, after accounting for all observed covariates.
+
+# The confidence interval is [0.387, 0.437] meaning we are 95% confident that the average effect lies between in this interval.
+
+# Since p-value is less than 2e-16, it is highly statistically significant, meaning the treatment has a positive effect on student achievement.
+```
+
+```{r}
+# 2. IPTW
+
+# propensity scores
+prop_model <- glm(z ~ selfrpt + gender + race + fgen + urban + mindset + test + sch_race + pov + size,
+                data = data, family = binomial)
+data$prop_score <- predict(prop_model, type = "response")
+
+# Compute IPTW weights
+data$weights <- ifelse(data$z == 1, 1 / data$prop_score, 1 / (1 - data$prop_score))
+
+# Diagnostic plot
+love.plot(
+  bal.tab(prop_model, weights = data$weights, method = "weighting", estimand = "ATE"),
+  colors = c("purple", "orange"),
+  thresholds = c(m = 0.1),
+  stars = "raw",
+  abs = TRUE,
+  var.order = "unadjusted"
+)
+
+# Propensity Score Distribution 
+ggplot(data, aes(x = prop_score, fill = factor(z))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Propensity Score Distribution by Treatment Group",
+       x = "Propensity Score", fill = "Treatment (z)") +
+  theme_minimal()
+
+# Weighted regression
+des <- svydesign(ids = ~1, weights = ~weights, data = data)
+iptw <- svyglm(y ~ z, design = des)
+summary(iptw)
+
+# ATE and CI
+iptw_ate <- coef(iptw)["z"]
+iptw_ci <- confint(iptw)["z", ]
+cat("IPTW ATE:", iptw_ate, "CI:", iptw_ci, "\n")
+```
+
+```{r}
+# After applying IPTW, the estimated ATE is 0.4145 with a 95% CI of [0.382, 0.446].
+
+# The covariate balance plot shows strong improvement after weighting.
+```
+
+```{r}
+# 3. Doubly Robust Estimation
+
+# regression model
+dr_model <- lm(y ~ z + selfrpt + gender + race + fgen + urban + mindset + test + sch_race + pov + size, data = data)
+
+# Predict estimates with and without treatment
+data$mu1 <- predict(dr_model, newdata = data %>% mutate(z = 1))
+data$mu0 <- predict(dr_model, newdata = data %>% mutate(z = 0))
+
+# DR estimator
+dr_estimate <- mean(
+  data$z * (data$y - data$mu1) / data$prop_score +
+  (1 - data$z) * (data$y - data$mu0) / (1 - data$prop_score) +
+  data$mu1 - data$mu0
+)
+
+cat("Doubly Robust ATE:", dr_estimate, "\n")
+```
+
+```{r}
+# Doubly Robust combines outcome regression and IPTW weighting and estimated ATE as 0.4144.
+
+# The result is similar to linear regression and IPTW estimates, which reinforces the positive effect of treatment.
+```
+
+```{r}
+# Set seed for reproducibility
+set.seed(123)
+
+# Number of bootstrap samples
+num_boot <- 100
+dr_ates <- numeric(num_boot)
+
+for (i in 1:num_boot) {
+  # Resample with replacement
+  boot_data <- data[sample(1:nrow(data), replace = TRUE), ]
+
+  # Fit bootstrap model
+  boot_model <- lm(y ~ z + selfrpt + gender + race + fgen + urban + mindset + test + sch_race + pov + size, data = boot_data)
+
+  m1 <- predict(boot_model, newdata = boot_data %>% mutate(z = 1))
+  m0 <- predict(boot_model, newdata = boot_data %>% mutate(z = 0))
+  eps <- 1e-6
+  ps <- pmin(pmax(boot_data$prop_score, eps), 1 - eps)
+
+  # DR estimate for bootstrap sample
+  dr_ates[i] <- mean(
+    boot_data$z * (boot_data$y - m1) / ps +
+    (1 - boot_data$z) * (boot_data$y - m0) / (1 - ps) +
+    m1 - m0
+  )
+}
+
+# 95% CI 
+ci_dr <- quantile(dr_ates, probs = c(0.025, 0.975))
+cat("Bootstrap 95% CI for DR ATE:", ci_dr, "\n")
+
+# Histogram of bootstrapped ATEs
+dr_df <- data.frame(dr_ate = dr_ates)
+
+ggplot(dr_df, aes(x = dr_ate)) +
+  geom_histogram(fill = "purple", color = "black", bins = 30) +
+  geom_vline(xintercept = mean(dr_ates), linetype = "dashed", color = "red", size = 1) +
+  labs(title = "Bootstrapped ATEs from DR",
+       x = "DR ATE", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+# Based on the doubly robust method, the growth mindset intervention led to an average increase of ~0.41 points in student achievement.
+# With 95% confidence, the true effect lies between 0.383 and 0.441.
+```
